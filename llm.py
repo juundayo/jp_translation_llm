@@ -11,26 +11,146 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
+from collections import Counter
+import MeCab
+import unidic_lite
 import math
 import copy
+import re
 
 # ----------------------------------------------------------------------------#
 
-'''"
+'''
 Dataset format: 
 English sentence     Japanese Sentence     Source
 Symbols are used as separators to extract the sentences.
 '''
-DATASET_PATH = "/home/ml3/Downloads/jpn-eng/jpn.txt"
-SRC_VOCAB_SIZE = 5000
-TGT_VOCAB_SIZE = 5000
-MAX_SQL_LENGTH = 50
-BATCH_SIZE = 64
-D_MODEL = 258
-NUM_HEADS = 8
-NUM_LAYERS = 6
-D_FF = 2048
+DATASET_PATH = "/home/ml3/Desktop/Thesis/.venv/jpn.txt"
 
+'''Dataset variables.'''
+SRC_VOCAB_SIZE = 10000
+TGT_VOCAB_SIZE = 10000
+MAX_SQL_LENGTH = 50
+VOCAB_SIZE = 10000
+PAD_IDX = 0
+UNK_IDX = 1
+SOS_IDX = 2
+EOS_IDX = 3
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+mecab = MeCab.Tagger("-d " + unidic_lite.DICDIR + " -Owakati")
+TRAIN = False
+EPOCHS = 25
+BATCH_SIZE = 32
+D_MODEL = 256
+NUM_HEADS = 2
+NUM_LAYERS = 4
+D_FF = 512
+
+# ----------------------------------------------------------------------------#
+
+'''Data preparation: Tokenization, Vocabulary and sentence encoding.'''
+
+def tokenize(sentence):
+    return re.findall(r"\b\w+\b", sentence.lower())
+
+def tokenize_japanese(sentence):    
+    if sentence.strip() == "":
+        return []
+    result = mecab.parse(sentence)
+    if result is None:
+        return []
+    
+    return result.strip().split()
+
+def build_vocab(sentences, lang, max_vocab_size):
+    counter = Counter()
+    for sentence in sentences:
+        tokens = tokenize_japanese(sentence) if lang == 'jpn' else tokenize(sentence)
+        counter.update(tokens)
+
+    # Getting the most common words. -4 used for special characters.
+    most_common = counter.most_common(max_vocab_size - 4)
+    idx2word = ['<PAD>', '<UNK>', '<SOS>', '<EOS>'] + [word for word, _ in most_common]
+    word2idx = {word: idx for idx, word in enumerate(idx2word)}
+
+    if lang == 'jpn':
+        for sentence in sentences[:5]:
+            print("Original JP:", sentence)
+            print("Tokens JP:", tokenize_japanese(sentence))
+
+    return idx2word, word2idx
+
+def encode_japanese(sentence, word2idx, max_len=MAX_SQL_LENGTH):
+    tokens = tokenize_japanese(sentence)
+    if not tokens:
+        tokens = ['<UNK>']
+    
+    indices = [word2idx.get(token, word2idx['<UNK>']) for token in tokens]
+    indices = [word2idx['<SOS>']] + indices + [word2idx['<EOS>']]
+    
+    if len(indices) < max_len:
+        indices += [word2idx['<PAD>']] * (max_len - len(indices))
+    else:
+        indices = indices[:max_len]
+
+    return indices
+
+def encode_sentence(sentence, word2idx, max_len=MAX_SQL_LENGTH):
+    tokens = tokenize(sentence)
+
+    if not tokens:
+        tokens = ['<UNK>']
+
+    indices = [word2idx.get(token, word2idx["<UNK>"]) for token in tokens]
+    indices = [word2idx["<SOS>"]] + indices + [word2idx["<EOS>"]]
+
+    if len(indices) < max_len:
+        indices += [word2idx["<PAD>"]] * (max_len - len(indices))
+    else:
+        indices = indices[:max_len]
+
+    return indices
+
+# ----------------------------------------------------------------------------#
+
+class TranslationDataset(data.Dataset):
+    def __init__(self, filepath, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE):
+        with open(filepath, encoding='utf-8') as f:
+            lines = f.readlines()
+
+        eng_sentences, jpn_sentences = [], []
+        for line in lines:
+            if '\t' not in line: # Tab seperators.
+                continue
+
+            eng, jpn = line.strip().split('\t')[:2]
+            eng_sentences.append(eng)
+            jpn_sentences.append(jpn)
+
+        self.src_sentences = eng_sentences
+        self.tgt_sentences = jpn_sentences
+
+        self.idx2src, self.src_word2idx = build_vocab(eng_sentences, 
+                                                      lang='eng', 
+                                                      max_vocab_size=SRC_VOCAB_SIZE)
+        self.idx2tgt, self.tgt_word2idx = build_vocab(jpn_sentences, 
+                                                      lang='jpn', 
+                                                      max_vocab_size=TGT_VOCAB_SIZE)
+
+        self.pairs = [
+            (encode_sentence(src, self.src_word2idx),
+             encode_japanese(tgt, self.tgt_word2idx))
+             for src, tgt in zip(eng_sentences, jpn_sentences)
+        ]
+
+    def __len__(self):
+            return len(self.pairs)
+        
+    def __getitem__(self, idx):
+        src, tgt = self.pairs[idx]
+        return torch.tensor(src), torch.tensor(tgt)
+    
 # ----------------------------------------------------------------------------#
 
 class Attention(nn.Module):
@@ -131,7 +251,7 @@ class EncoderLayer(nn.Module):
 # ----------------------------------------------------------------------------#
 
 class DecoderLayer(nn.Module):
-    def __init__(self, d_model, num_heads, d_ff, dropout):
+    def __init__(self, d_model, num_heads, d_ff):
         super(DecoderLayer, self).__init__()
         self.self_attn = Attention(d_model, num_heads)
         self.cross_attn = Attention(d_model, num_heads)
@@ -154,16 +274,16 @@ class DecoderLayer(nn.Module):
 
 class Transformer(nn.Module):
     def __init__(self, src_vocab_size, tgt_vocab_size, d_model, num_heads, 
-                 num_layers, d_ff, max_seq_length, dropout):
+                 num_layers, d_ff, max_seq_length):
         super(Transformer, self).__init__()
         self.encoder_embedding = nn.Embedding(src_vocab_size, d_model)
         self.decoder_embedding = nn.Embedding(tgt_vocab_size, d_model)
         self.positional_encoding = PositionalEncoding(d_model, max_seq_length)
 
         self.encoder_layers = nn.ModuleList([EncoderLayer(
-                d_model, num_heads, d_ff, dropout) for _ in range(num_layers)])
+                d_model, num_heads, d_ff) for _ in range(num_layers)])
         self.decoder_layers = nn.ModuleList([DecoderLayer(
-                d_model, num_heads, d_ff, dropout) for _ in range(num_layers)])
+                d_model, num_heads, d_ff) for _ in range(num_layers)])
 
         self.fc = nn.Linear(d_model, tgt_vocab_size)
         self.dropout = nn.Dropout(0.1)
@@ -172,8 +292,10 @@ class Transformer(nn.Module):
         src_mask = (src != 0).unsqueeze(1).unsqueeze(2)
         tgt_mask = (tgt != 0).unsqueeze(1).unsqueeze(3)
         seq_length = tgt.size(1)
-        nopeak_mask = (1 - torch.triu(torch.ones(1, seq_length, 
-                                                 seq_length), diagonal=1)).bool()
+        nopeak_mask = (1 - torch.triu(
+            torch.ones(1, seq_length, seq_length, device=src.device), 
+            diagonal=1)).bool()
+
         tgt_mask = tgt_mask & nopeak_mask
         return src_mask, tgt_mask
 
@@ -197,10 +319,107 @@ class Transformer(nn.Module):
     
 # ----------------------------------------------------------------------------#
 
+def get_loader(DATASET_PATH):
+    dataset = TranslationDataset(DATASET_PATH, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE)
+    return data.DataLoader(dataset, batch_size=BATCH_SIZE, 
+                            shuffle=True), dataset
+
+def translate(model, src_sentence, src_word2idx, tgt_idx2word, max_length=50):
+    model.eval()
+    src_encoded = encode_sentence(src_sentence, src_word2idx)
+    src_tensor = torch.tensor(src_encoded).unsqueeze(0).to(DEVICE)
+
+    generated = [SOS_IDX]
+    for _ in range(max_length):
+        tgt_tensor = torch.tensor([generated], device=DEVICE)
+        
+        with torch.no_grad():
+            output = model(src_tensor, tgt_tensor)
+        
+        logits = output[0, -1]
+        logits[UNK_IDX] = -float('inf')  # Block UNK.
+        logits[PAD_IDX] = -float('inf')  # Block PAD.
+        
+        probs = torch.softmax(logits / 0.7, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1).item()
+        
+        generated.append(next_token)
+        if next_token == EOS_IDX:
+            break
+
+    # Converting to text and filtering special tokens.
+    return ' '.join(tgt_idx2word[idx] for idx in generated 
+                   if idx not in [SOS_IDX, EOS_IDX, PAD_IDX, UNK_IDX])
+
+# ----------------------------------------------------------------------------#
+
 if __name__ == '__main__':    
-    transformer = Transformer(SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, D_MODEL, 
-                              NUM_HEADS, NUM_LAYERS, D_FF, MAX_SQL_LENGTH)
+    dataloader, dataset = get_loader(DATASET_PATH)
+    print("Loaded data successfully.")
+
+    print("\n=== Data Verification ===")
+    print("Sample training pair:")
+    print("EN:", dataset.src_sentences[1000])
+    print("JP:", dataset.tgt_sentences[1000])
+    print("Encoded JP:", [dataset.idx2tgt[i] for i in encode_japanese(dataset.tgt_sentences[1000], 
+                                                                      dataset.tgt_word2idx)])
+
+    model = Transformer(
+        SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, D_MODEL, 
+        NUM_HEADS, NUM_LAYERS, D_FF, MAX_SQL_LENGTH).to(DEVICE)
     
-    # Generating random sample data.
-    src_data = torch.randint(1, SRC_VOCAB_SIZE, (BATCH_SIZE, MAX_SQL_LENGTH)) 
-    tgt_data = torch.randint(1, SRC_VOCAB_SIZE, (BATCH_SIZE, MAX_SQL_LENGTH))
+    if TRAIN:
+        criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+        optimizer = optim.Adam(model.parameters(), lr=0.0001, betas=(0.9, 0.98))
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+        
+        for epoch in range(EPOCHS):
+            model.train()
+            total_loss = 0
+            
+            for src_data, tgt_data in dataloader:
+                src_data, tgt_data = src_data.to(DEVICE), tgt_data.to(DEVICE)
+                
+                optimizer.zero_grad()
+                output = model(src_data, tgt_data[:, :-1])
+                
+                loss = criterion(output.contiguous().view(-1, TGT_VOCAB_SIZE), 
+                                tgt_data[:, 1:].contiguous().view(-1))
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                
+                total_loss += loss.item()
+            
+            scheduler.step()
+            avg_loss = total_loss / len(dataloader)
+            print(f"Epoch: {epoch+1}, Loss: {avg_loss:.4f}")
+
+        torch.save(model.state_dict(), "llm.pth")
+    else:
+        model = Transformer(SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, D_MODEL,
+                    NUM_HEADS, NUM_LAYERS, D_FF, MAX_SQL_LENGTH).to(DEVICE)
+        model.load_state_dict(torch.load("llm.pth"))
+        model.eval()
+
+        print("\n=== Model Output Verification ===")
+        print()
+        
+        word = "It will be a sunny day tomorrow."
+        print("Input: ", word)
+        translated = translate(model, word, dataset.src_word2idx, dataset.idx2tgt)
+        print("Translation:", translated)
+        
+        test_src = "It is old.?"
+        print("Input:", test_src)
+        src_encoded = encode_sentence(test_src, dataset.src_word2idx)
+        src_tensor = torch.tensor(src_encoded).unsqueeze(0).to(DEVICE)
+        
+        with torch.no_grad():
+            test_output = model(src_tensor, torch.tensor([[SOS_IDX]], device=DEVICE))
+        
+        topk_values, topk_indices = torch.softmax(test_output[0,0], dim=-1).topk(5)
+        print("First prediction distribution:")
+        for val, idx in zip(topk_values, topk_indices):
+            print(f"{dataset.idx2tgt[idx.item()]}: {val.item():.4f}")
+
