@@ -3,6 +3,10 @@
 '''
 Dataset:
 English-Japanese version in http://www.manythings.org/anki/ 
+
+Dataset format: 
+English sentence     Japanese Sentence     Source
+Symbols are used as separators to extract the sentences.
 '''
 
 # ----------------------------------------------------------------------------#
@@ -20,13 +24,6 @@ import re
 
 # ----------------------------------------------------------------------------#
 
-'''
-Dataset format: 
-English sentence     Japanese Sentence     Source
-Symbols are used as separators to extract the sentences.
-'''
-DATASET_PATH = "/home/ml3/Desktop/Thesis/.venv/jpn.txt"
-
 '''Dataset variables.'''
 SRC_VOCAB_SIZE = 10000
 TGT_VOCAB_SIZE = 10000
@@ -37,8 +34,8 @@ UNK_IDX = 1
 SOS_IDX = 2
 EOS_IDX = 3
 
+DATASET_PATH = "/home/ml3/Desktop/Thesis/.venv/jpn.txt"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-mecab = MeCab.Tagger("-d " + unidic_lite.DICDIR + " -Owakati")
 TRAIN = False
 EPOCHS = 25
 BATCH_SIZE = 32
@@ -46,6 +43,7 @@ D_MODEL = 256
 NUM_HEADS = 2
 NUM_LAYERS = 4
 D_FF = 512
+mecab = MeCab.Tagger("-d " + unidic_lite.DICDIR + " -Owakati")
 
 # ----------------------------------------------------------------------------#
 
@@ -410,7 +408,7 @@ if __name__ == '__main__':
         translated = translate(model, word, dataset.src_word2idx, dataset.idx2tgt)
         print("Translation:", translated)
         
-        test_src = "It is old.?"
+        test_src = "It is old."
         print("Input:", test_src)
         src_encoded = encode_sentence(test_src, dataset.src_word2idx)
         src_tensor = torch.tensor(src_encoded).unsqueeze(0).to(DEVICE)
